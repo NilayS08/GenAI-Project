@@ -16,11 +16,14 @@ import logging
 import os
 import re
 from typing import Any
+from dotenv import load_dotenv
 
 import google.generativeai as genai
 from fastapi import HTTPException
 
 from app.services.prompts import SYSTEM_PROMPT, build_prompt
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 

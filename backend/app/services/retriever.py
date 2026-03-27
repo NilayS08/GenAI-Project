@@ -1,25 +1,14 @@
 """
 retriever.py — Document ingestion pipeline + retrieval interface.
 
-This is the public-facing module that glues together:
-    parser → chunker → cleaner → embedder → vector_store
+IMPORTANT ordering fix:
+    Chunking must happen on the RAW parsed text (before clean_text).
+    clean_text collapses all newlines to spaces, which merges [Page N]
+    markers into the text body. When that happens, _sliding_window_chunks
+    sees a single line starting with "[Page 1]", treats the entire document
+    as a page-marker line, and drops all words → zero chunks.
 
-Two entry points:
-    1. ingest_document(doc_id, filename, file_bytes)
-       Called by /upload after parsing succeeds.
-       Embeds all chunks and persists the FAISS index.
-
-    2. retrieve(doc_id, query, k)
-       Called by llm_service.py to fetch relevant context before
-       sending a prompt to Gemini.
-
-Chunk size tuning (256-512 tokens):
-    - Target: ~350 words ≈ 500 tokens (safe for MiniLM's 256-token limit
-      after BPE overhead, and well within Gemini's context).
-    - Overlap: 50 words between adjacent chunks preserves cross-boundary
-      context for questions that straddle a boundary.
-    - The CHUNK_SIZE / CHUNK_OVERLAP constants below can be tuned via
-      environment variables without code changes.
+    Correct order: parse → chunk (reads markers) → clean each chunk → embed.
 """
 
 from __future__ import annotations
@@ -27,7 +16,6 @@ from __future__ import annotations
 import logging
 import os
 
-from app.services.cleaner import clean_text
 from app.services.parser import parse_document
 from app.services.vector_store import SearchResult, VectorStore
 
@@ -37,18 +25,13 @@ logger = logging.getLogger(__name__)
 # Tunable chunk parameters
 # ---------------------------------------------------------------------------
 
-# Target chunk size in words (≈350 words → ~500 BPE tokens)
-CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE",    "350"))
-
-# Overlap in words between adjacent chunks
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "50"))
-
-# Default number of chunks to retrieve per query
+CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE",      "350"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP",   "50"))
 DEFAULT_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "5"))
 
 
 # ---------------------------------------------------------------------------
-# Sliding-window chunker with overlap
+# Sliding-window chunker  (operates on RAW text — before clean_text)
 # ---------------------------------------------------------------------------
 
 def _sliding_window_chunks(
@@ -58,29 +41,28 @@ def _sliding_window_chunks(
     source: str     = "",
 ) -> tuple[list[str], list[dict]]:
     """
-    Split text into overlapping word-window chunks.
+    Split raw parsed text into overlapping word-window chunks.
 
-    Handles [Page N] and [Slide N] markers inserted by the parser so
-    each chunk carries the correct page/slide number in its metadata.
+    Must receive the text BEFORE clean_text() is applied so that
+    [Page N] / [Slide N] markers appear on their own lines and can
+    be detected to populate chunk metadata.
+
+    Each chunk is individually cleaned (whitespace normalised) after
+    the words are extracted.
 
     Args:
-        text:       Full document text (may contain [Page N] markers).
+        text:       Raw document text from the parser (with [Page N] markers).
         chunk_size: Target chunk size in words.
-        overlap:    Number of words shared between adjacent chunks.
-        source:     Filename — stored in chunk metadata.
+        overlap:    Words shared between adjacent chunks.
+        source:     Original filename — stored in chunk metadata.
 
     Returns:
-        (chunks, metadata_list) where each metadata dict has keys:
-            source, page (int)
+        (chunks, metadata_list)
     """
     if chunk_size <= overlap:
         raise ValueError("chunk_size must be greater than overlap")
 
-    step     = chunk_size - overlap
-    chunks   = []
-    metadata = []
-
-    # Split into lines and track current page/slide
+    step = chunk_size - overlap
     current_page = 0
     words_with_page: list[tuple[str, int]] = []
 
@@ -88,7 +70,7 @@ def _sliding_window_chunks(
         stripped = line.strip()
         if not stripped:
             continue
-        # Detect page / slide markers from parser output
+        # Page/slide markers are on their own lines in parser output
         if stripped.startswith("[Page ") or stripped.startswith("[Slide "):
             try:
                 current_page = int(stripped.split()[-1].rstrip("]"))
@@ -104,15 +86,20 @@ def _sliding_window_chunks(
     words = [w for w, _ in words_with_page]
     pages = [p for _, p in words_with_page]
 
+    chunks:   list[str]  = []
+    metadata: list[dict] = []
+
     i = 0
     while i < len(words):
-        end   = min(i + chunk_size, len(words))
-        chunk = " ".join(words[i:end])
-        page  = pages[i]   # page of the first word in the chunk
+        end       = min(i + chunk_size, len(words))
+        raw_chunk = " ".join(words[i:end])
+        page      = pages[i]
 
-        # Skip degenerate chunks that are too short to be meaningful
-        if len(chunk.split()) >= 5:
-            chunks.append(chunk)
+        # Normalise whitespace per chunk (replaces clean_text for chunks)
+        cleaned_chunk = " ".join(raw_chunk.split())
+
+        if len(cleaned_chunk.split()) >= 5:
+            chunks.append(cleaned_chunk)
             metadata.append({"source": source, "page": page})
 
         if end == len(words):
@@ -135,67 +122,45 @@ def ingest_document(
     """
     Parse, chunk, embed, and persist a document.
 
-    Called by the /upload endpoint after file validation.
     Returns the number of chunks indexed.
-
-    If a FAISS index already exists for this doc_id and force_reindex
-    is False, the function returns immediately (idempotent).
-
-    Args:
-        doc_id:        Unique document identifier (UUID from /upload).
-        filename:      Original filename (used for metadata + routing).
-        file_bytes:    Raw file content.
-        force_reindex: Rebuild the index even if one already exists.
-
-    Returns:
-        Number of chunks indexed.
+    Idempotent — skips re-embedding if the index already exists
+    (unless force_reindex=True).
     """
-    # Idempotency check
     if not force_reindex and VectorStore.exists(doc_id):
         logger.info("Index already exists for doc_id=%s, skipping ingest", doc_id)
-        vs = VectorStore.load(doc_id)
-        return vs.size
+        return VectorStore.load(doc_id).size
 
-    logger.info("Ingesting document: %s (doc_id=%s)", filename, doc_id)
+    logger.info("Ingesting: %s (doc_id=%s)", filename, doc_id)
 
-    # # 1. Parse raw text
-    # raw_text = parse_document(filename, file_bytes)
-    # if not raw_text.strip():
-    #     raise ValueError("No text extracted from document — cannot index.")
-
-    # 1. Parse raw text
+    # 1. Parse — keeps [Page N] / [Slide N] markers on separate lines
     raw_text = parse_document(filename, file_bytes)
-    logger.info(f"DEBUG: raw_text length: {len(raw_text)} chars, {len(raw_text.split())} words")
+    if not raw_text.strip():
+        raise ValueError("No text extracted from document — cannot index.")
 
-    # 2. Clean
-    cleaned_text = clean_text(raw_text)
-    logger.info(f"DEBUG: cleaned_text length: {len(cleaned_text)} chars, {len(cleaned_text.split())} words")
-
-    # # 3. Sliding-window chunk with overlap
-    # chunks, meta = _sliding_window_chunks(
-    #     cleaned_text,
-    #     chunk_size=CHUNK_SIZE,
-    #     overlap=CHUNK_OVERLAP,
-    #     source=filename,
-    # )
-    
-    # 3. Sliding-window chunk
-    chunks, meta = _sliding_window_chunks(cleaned_text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP, source=filename)
-    logger.info(f"DEBUG: chunks produced: {len(chunks)}, first chunk: {chunks[0][:100] if chunks else 'NONE'}")
+    # 2. Chunk the RAW text so page markers are still on their own lines
+    chunks, meta = _sliding_window_chunks(
+        raw_text,
+        chunk_size=CHUNK_SIZE,
+        overlap=CHUNK_OVERLAP,
+        source=filename,
+    )
 
     if not chunks:
-        raise ValueError("Document produced zero indexable chunks.")
+        raise ValueError(
+            f"Document produced zero indexable chunks "
+            f"(raw_text={len(raw_text)} chars, {len(raw_text.split())} words)."
+        )
 
     logger.info(
-        "Created %d chunks (size≈%d words, overlap=%d) for %s",
+        "Created %d chunks (size=%d words, overlap=%d) for %s",
         len(chunks), CHUNK_SIZE, CHUNK_OVERLAP, filename,
     )
 
-    # 4. Embed + index
+    # 3. Embed + index
     vs = VectorStore(doc_id)
     vs.add_documents(chunks, meta)
 
-    # 5. Persist
+    # 4. Persist to disk
     vs.save()
 
     return len(chunks)
@@ -209,27 +174,12 @@ def retrieve(
     """
     Retrieve the top-k most relevant chunks for a query.
 
-    Loads the FAISS index from disk (cached by OS page cache on repeat
-    calls) and returns ranked SearchResult objects.
-
-    Args:
-        doc_id: Document identifier.
-        query:  Natural language query.
-        k:      Number of results to return (default: DEFAULT_TOP_K).
-
-    Returns:
-        List of SearchResult sorted by descending cosine similarity.
-
     Raises:
         FileNotFoundError: If no index exists for this doc_id.
     """
-    vs = VectorStore.load(doc_id)
+    vs      = VectorStore.load(doc_id)
     results = vs.search(query, k=k)
-
-    logger.debug(
-        "Retrieved %d chunks for query=%r (doc_id=%s)",
-        len(results), query[:60], doc_id,
-    )
+    logger.debug("Retrieved %d chunks for query=%r", len(results), query[:60])
     return results
 
 
@@ -240,20 +190,8 @@ def retrieve_context_string(
     max_chars: int = 6000,
 ) -> str:
     """
-    Retrieve top-k chunks and return them as a single formatted string
-    ready to inject into an LLM prompt.
-
-    Each chunk is prefixed with its source + page for traceability.
-    The output is truncated at max_chars to stay within token limits.
-
-    Args:
-        doc_id:    Document identifier.
-        query:     Natural language query (used for retrieval ranking).
-        k:         Number of chunks to retrieve.
-        max_chars: Hard character cap on the returned string.
-
-    Returns:
-        Formatted context string.
+    Retrieve top-k chunks as a single formatted string for LLM injection.
+    Truncated at max_chars.
     """
     results = retrieve(doc_id, query, k=k)
 
@@ -271,71 +209,3 @@ def retrieve_context_string(
         total += len(chunk)
 
     return "\n".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# Smoke test  (python -m app.services.retriever)
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import json
-    import tempfile
-    import uuid
-
-    logging.basicConfig(level=logging.INFO)
-
-    SAMPLE_TEXT = """
-[Page 1]
-Machine learning is a subset of artificial intelligence.
-It enables computers to learn from data without being explicitly programmed.
-
-[Page 2]
-Supervised learning uses labelled training data.
-The model learns a mapping from inputs to outputs.
-Common algorithms include linear regression, decision trees, and neural networks.
-
-[Page 3]
-Unsupervised learning discovers hidden patterns without labels.
-Clustering algorithms group similar data points together.
-Dimensionality reduction techniques like PCA reduce feature space.
-
-[Page 4]
-Neural networks are inspired by the human brain.
-They consist of layers of interconnected nodes called neurons.
-Deep learning uses many hidden layers to learn complex representations.
-Backpropagation is the algorithm used to train neural networks.
-"""
-
-    doc_id  = str(uuid.uuid4())
-    tmpfile = tempfile.NamedTemporaryFile(suffix=".txt", delete=False)
-    tmpfile.write(SAMPLE_TEXT.encode())
-    tmpfile.close()
-
-    print("=== Chunking test ===")
-    chunks, meta = _sliding_window_chunks(SAMPLE_TEXT, chunk_size=30, overlap=5)
-    print(f"Produced {len(chunks)} chunks")
-    for i, (c, m) in enumerate(zip(chunks, meta)):
-        print(f"  Chunk {i} [page={m['page']}]: {c[:60]}...")
-
-    print("\n=== Ingest test ===")
-    with open(tmpfile.name, "rb") as f:
-        n = ingest_document(doc_id, "sample.txt", f.read())
-    print(f"Indexed {n} chunks for doc_id={doc_id}")
-
-    print("\n=== Retrieval test ===")
-    queries = [
-        "What is backpropagation?",
-        "How does unsupervised learning work?",
-        "What are neural networks?",
-    ]
-    for q in queries:
-        results = retrieve(doc_id, q, k=2)
-        print(f"\nQuery: {q!r}")
-        for r in results:
-            print(f"  score={r.score:.4f}  text={r.text[:80]}...")
-
-    print("\n=== Context string test ===")
-    ctx = retrieve_context_string(doc_id, "explain deep learning")
-    print(ctx[:300])
-
-    print("\nAll smoke tests passed.")
